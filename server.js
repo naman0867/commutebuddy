@@ -45,7 +45,8 @@ app.get("/api/commuters/:id/matches", (req, res) => {
       const gap = Math.abs(me.depart_minutes - o.depart_minutes);
       // lower is better; each term normalized to roughly 0..1
       const score = homeKm / MAX_KM + officeKm / MAX_KM + gap / MAX_GAP;
-      return { id: o.id, name: o.name, homeKm, officeKm, gap, score };
+   return { id: o.id, name: o.name, homeKm, officeKm, gap, score,
+  home: [o.home_lat, o.home_lng], office: [o.office_lat, o.office_lng] };
     })
     .filter(m => m.homeKm <= MAX_KM && m.officeKm <= MAX_KM && m.gap <= MAX_GAP)
     .sort((a, b) => a.score - b.score);
