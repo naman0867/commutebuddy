@@ -3,9 +3,12 @@ const Database = require("better-sqlite3");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 
 const SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
-const db = new Database("commute.db");
+const isTest = process.env.NODE_ENV === "test";
+const db = new Database(process.env.DB_PATH || "commute.db");
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +33,25 @@ CREATE TABLE IF NOT EXISTS requests (
 `);
 
 const app = express();
-app.use(cors(), express.json());
+app.use(cors(), express.json({ limit: "10kb" }));
+
+// ---------- Rate limiting (off in tests) ----------
+const passThrough = (req, res, next) => next();
+const makeLimiter = (windowMs, limit, message) =>
+  isTest
+    ? passThrough
+    : rateLimit({ windowMs, limit, standardHeaders: true, legacyHeaders: false, message: { error: message } });
+
+const authLimiter = makeLimiter(15 * 60 * 1000, 20, "too many attempts, try again in 15 minutes");
+const apiLimiter = makeLimiter(60 * 1000, 120, "too many requests, slow down");
+app.use("/api", apiLimiter);
+
+// ---------- Validation helpers ----------
+const isNum = v => typeof v === "number" && Number.isFinite(v);
+const validLat = v => isNum(v) && v >= -90 && v <= 90;
+const validLng = v => isNum(v) && v >= -180 && v <= 180;
+const validEmail = e =>
+  typeof e === "string" && e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
 const sign = id => jwt.sign({ id }, SECRET, { expiresIn: "7d" });
 
@@ -40,6 +61,7 @@ function auth(req, res, next) {
   catch { res.status(401).json({ error: "please log in" }); }
 }
 
+// ---------- Distance helpers ----------
 function km(lat1, lng1, lat2, lng2) {
   const R = 6371, rad = d => (d * Math.PI) / 180;
   const dLat = rad(lat2 - lat1), dLng = rad(lng2 - lng1);
@@ -48,13 +70,50 @@ function km(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+function straightKm(points) {
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i++) total += km(...points[i], ...points[i + 1]);
+  return total;
+}
+
+// Real driving distance through all points, via the public OSRM demo server.
+// Returns null on any failure so callers can fall back to straight-line estimates.
+const roadCache = new Map();
+async function roadKm(points) {
+  if (isTest || process.env.USE_OSRM === "false") return null;
+  const key = points.map(p => p.map(n => n.toFixed(4)).join(",")).join(";");
+  if (roadCache.has(key)) return roadCache.get(key);
+  try {
+    const coords = points.map(([lat, lng]) => `${lng},${lat}`).join(";"); // OSRM wants lng,lat
+    const r = await fetch(
+      `https://router.project-osrm.org/route/v1/driving/${coords}?overview=false`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    const data = await r.json();
+    const meters = data.routes && data.routes[0] && data.routes[0].distance;
+    if (typeof meters === "number") {
+      roadCache.set(key, meters / 1000);
+      return meters / 1000;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+async function pathKm(points) {
+  const road = await roadKm(points);
+  return road !== null
+    ? { km: road, source: "road" }
+    : { km: straightKm(points), source: "estimate" };
+}
+
 const myCommuter = uid => db.prepare("SELECT * FROM commuters WHERE user_id = ?").get(uid);
 
 // ---------- Auth ----------
-app.post("/api/register", (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password || password.length < 8)
-    return res.status(400).json({ error: "email and 8+ character password required" });
+app.post("/api/register", authLimiter, (req, res) => {
+  const { email, password } = req.body || {};
+  if (!validEmail(email)) return res.status(400).json({ error: "enter a valid email" });
+  if (typeof password !== "string" || password.length < 8 || password.length > 72)
+    return res.status(400).json({ error: "password must be 8 to 72 characters" });
   try {
     const info = db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
       .run(email.toLowerCase(), bcrypt.hashSync(password, 10));
@@ -64,10 +123,12 @@ app.post("/api/register", (req, res) => {
   }
 });
 
-app.post("/api/login", (req, res) => {
-  const user = db.prepare("SELECT * FROM users WHERE email = ?")
-    .get((req.body.email || "").toLowerCase());
-  if (!user || !bcrypt.compareSync(req.body.password || "", user.password_hash))
+app.post("/api/login", authLimiter, (req, res) => {
+  const { email, password } = req.body || {};
+  const user = typeof email === "string"
+    ? db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase())
+    : null;
+  if (!user || typeof password !== "string" || !bcrypt.compareSync(password, user.password_hash))
     return res.status(401).json({ error: "invalid email or password" });
   res.json({ token: sign(user.id) });
 });
@@ -76,58 +137,90 @@ app.post("/api/login", (req, res) => {
 app.get("/api/me", auth, (req, res) => res.json({ profile: myCommuter(req.userId) || null }));
 
 app.put("/api/me/profile", auth, (req, res) => {
-  const { name, home_lat, home_lng, office_lat, office_lng, depart_minutes } = req.body;
-  const nums = [home_lat, home_lng, office_lat, office_lng, depart_minutes];
-  if (!name || nums.some(v => typeof v !== "number" || !isFinite(v)))
-    return res.status(400).json({ error: "invalid profile" });
-  if (depart_minutes < 0 || depart_minutes >= 1440)
+  const b = req.body || {};
+  const name = typeof b.name === "string" ? b.name.trim() : "";
+  if (name.length < 1 || name.length > 60)
+    return res.status(400).json({ error: "name must be 1 to 60 characters" });
+  if (!validLat(b.home_lat) || !validLat(b.office_lat) || !validLng(b.home_lng) || !validLng(b.office_lng))
+    return res.status(400).json({ error: "invalid coordinates" });
+  if (!Number.isInteger(b.depart_minutes) || b.depart_minutes < 0 || b.depart_minutes >= 1440)
     return res.status(400).json({ error: "invalid departure time" });
 
   if (myCommuter(req.userId)) {
     db.prepare(`UPDATE commuters SET name=?, home_lat=?, home_lng=?, office_lat=?,
       office_lng=?, depart_minutes=? WHERE user_id=?`)
-      .run(name, home_lat, home_lng, office_lat, office_lng, depart_minutes, req.userId);
+      .run(name, b.home_lat, b.home_lng, b.office_lat, b.office_lng, b.depart_minutes, req.userId);
   } else {
     db.prepare(`INSERT INTO commuters (user_id, name, home_lat, home_lng, office_lat,
       office_lng, depart_minutes) VALUES (?,?,?,?,?,?,?)`)
-      .run(req.userId, name, home_lat, home_lng, office_lat, office_lng, depart_minutes);
+      .run(req.userId, name, b.home_lat, b.home_lng, b.office_lat, b.office_lng, b.depart_minutes);
   }
   res.json(myCommuter(req.userId));
 });
 
-// ---------- Matches ----------
-app.get("/api/me/matches", auth, (req, res) => {
-  const me = myCommuter(req.userId);
-  if (!me) return res.status(400).json({ error: "save your profile first" });
-  const MAX_KM = 2, MAX_GAP = 30;
-  const reqs = db.prepare("SELECT * FROM requests WHERE from_id = ? OR to_id = ?").all(me.id, me.id);
+// ---------- Matches (detour-cost ranking) ----------
+const MAX_KM = 2, MAX_GAP = 30, MAX_DETOUR = 5, MAX_CANDIDATES = 8;
 
-  const matches = db.prepare("SELECT * FROM commuters WHERE id != ?").all(me.id)
-    .map(o => {
-      const homeKm = km(me.home_lat, me.home_lng, o.home_lat, o.home_lng);
-      const officeKm = km(me.office_lat, me.office_lng, o.office_lat, o.office_lng);
-      const gap = Math.abs(me.depart_minutes - o.depart_minutes);
-      const score = homeKm / MAX_KM + officeKm / MAX_KM + gap / MAX_GAP;
+app.get("/api/me/matches", auth, async (req, res) => {
+  try {
+    const me = myCommuter(req.userId);
+    if (!me) return res.status(400).json({ error: "save your profile first" });
+    const reqs = db.prepare("SELECT * FROM requests WHERE from_id = ? OR to_id = ?").all(me.id, me.id);
+
+    // Step 1: cheap straight-line filter keeps road-routing calls to a handful
+    const candidates = db.prepare("SELECT * FROM commuters WHERE id != ?").all(me.id)
+      .map(o => ({
+        o,
+        homeKm: km(me.home_lat, me.home_lng, o.home_lat, o.home_lng),
+        officeKm: km(me.office_lat, me.office_lng, o.office_lat, o.office_lng),
+        gap: Math.abs(me.depart_minutes - o.depart_minutes),
+      }))
+      .filter(c => c.homeKm <= MAX_KM && c.officeKm <= MAX_KM && c.gap <= MAX_GAP)
+      .sort((a, b) => (a.homeKm + a.officeKm) - (b.homeKm + b.officeKm))
+      .slice(0, MAX_CANDIDATES);
+
+    // Step 2: detour = extra distance if YOU drive and pick them up
+    const myHome = [me.home_lat, me.home_lng], myOffice = [me.office_lat, me.office_lng];
+    const direct = await pathKm([myHome, myOffice]);
+
+    const matches = await Promise.all(candidates.map(async ({ o, homeKm, officeKm, gap }) => {
+      const theirHome = [o.home_lat, o.home_lng], theirOffice = [o.office_lat, o.office_lng];
+      const viaPoints = [myHome, theirHome, theirOffice, myOffice];
+      const via = await pathKm(viaPoints);
+
+      let detourKm, source;
+      if (via.source === direct.source) {
+        detourKm = via.km - direct.km;
+        source = via.source;
+      } else { // mixed sources would give nonsense, so compare like with like
+        detourKm = straightKm(viaPoints) - straightKm([myHome, myOffice]);
+        source = "estimate";
+      }
+      detourKm = Math.max(0, detourKm);
+
+      const score = detourKm / MAX_DETOUR + gap / MAX_GAP; // lower is better
       const r = reqs.find(r =>
         (r.from_id === me.id && r.to_id === o.id) || (r.from_id === o.id && r.to_id === me.id));
       return {
-        id: o.id, name: o.name, homeKm, officeKm, gap, score,
-        home: [o.home_lat, o.home_lng], office: [o.office_lat, o.office_lng],
+        id: o.id, name: o.name, homeKm, officeKm, gap, detourKm, detourSource: source, score,
+        home: theirHome, office: theirOffice,
         request: r ? { id: r.id, status: r.status, direction: r.from_id === me.id ? "sent" : "received" } : null,
       };
-    })
-    .filter(m => m.homeKm <= MAX_KM && m.officeKm <= MAX_KM && m.gap <= MAX_GAP)
-    .sort((a, b) => a.score - b.score);
+    }));
 
-  res.json(matches);
+    res.json(matches.sort((a, b) => a.score - b.score));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "something went wrong" });
+  }
 });
 
 // ---------- Ride requests ----------
 app.post("/api/requests", auth, (req, res) => {
   const me = myCommuter(req.userId);
   if (!me) return res.status(400).json({ error: "save your profile first" });
-  const toId = Number(req.body.to_id);
-  if (!toId || toId === me.id) return res.status(400).json({ error: "invalid request" });
+  const toId = Number((req.body || {}).to_id);
+  if (!Number.isInteger(toId) || toId === me.id) return res.status(400).json({ error: "invalid request" });
   if (!db.prepare("SELECT 1 FROM commuters WHERE id = ?").get(toId))
     return res.status(404).json({ error: "commuter not found" });
   const existing = db.prepare(
@@ -149,7 +242,7 @@ app.get("/api/requests", auth, (req, res) => {
 });
 
 app.patch("/api/requests/:id", auth, (req, res) => {
-  const { status } = req.body;
+  const { status } = req.body || {};
   if (!["accepted", "declined"].includes(status))
     return res.status(400).json({ error: "status must be accepted or declined" });
   const me = myCommuter(req.userId);
@@ -162,4 +255,7 @@ app.patch("/api/requests/:id", auth, (req, res) => {
   res.sendStatus(204);
 });
 
-app.listen(4000, () => console.log("API on :4000"));
+if (require.main === module) {
+  app.listen(4000, () => console.log("API on :4000"));
+}
+module.exports = { app, db };

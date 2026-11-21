@@ -156,6 +156,12 @@ function Main({ token, onLogout }) {
                 <strong>{m.name}</strong>
                 <div>Home {m.homeKm.toFixed(1)} km · Office {m.officeKm.toFixed(1)} km</div>
                 <div>Time gap {m.gap} min</div>
+                {m.detourKm != null && (
+                  <div>
+                    Detour if you drive: +{m.detourKm.toFixed(1)} km
+                    {" "}({m.detourSource === "road" ? "by road" : "estimate"})
+                  </div>
+                )}
                 {!m.request && (
                   <button onClick={() => sendRequest(m.id)} style={{ marginTop: 6 }}>Request ride</button>
                 )}
