@@ -208,10 +208,9 @@ function Main({ token, onLogout }) {
     <div className="app">
       <MapContainer className="map" center={[12.95, 77.68]} zoom={12} zoomControl={false}>
         <TileLayer
-          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-          subdomains="abcd"
+          url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
           maxZoom={19}
-          attribution="&copy; OpenStreetMap contributors &copy; CARTO"
+          attribution="&copy; OpenStreetMap contributors"
         />
         <ZoomControl position="bottomright" />
         <Clicker onPick={pick} />
