@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { MapContainer, TileLayer, CircleMarker, Polyline, Tooltip, useMapEvents } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
-const API = "http://localhost:4000/api";
+const API = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
 
 async function api(path, token, method = "GET", body) {
   const res = await fetch(API + path, {

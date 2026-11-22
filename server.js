@@ -6,6 +6,9 @@ const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 
 const SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET)
+  throw new Error("JWT_SECRET is required in production");
+
 const isTest = process.env.NODE_ENV === "test";
 const db = new Database(process.env.DB_PATH || "commute.db");
 
@@ -33,7 +36,11 @@ CREATE TABLE IF NOT EXISTS requests (
 `);
 
 const app = express();
-app.use(cors(), express.json({ limit: "10kb" }));
+app.set("trust proxy", 1); // Render sits behind a proxy; rate limiting needs the real client IP
+app.use(
+  cors({ origin: process.env.FRONTEND_URL || true }),
+  express.json({ limit: "10kb" })
+);
 
 // ---------- Rate limiting (off in tests) ----------
 const passThrough = (req, res, next) => next();
@@ -255,7 +262,33 @@ app.patch("/api/requests/:id", auth, (req, res) => {
   res.sendStatus(204);
 });
 
+// ---------- Health check and demo data ----------
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+function seedDemo() {
+  const people = [
+    ["ravi@demo.com", "Ravi", 12.9279, 77.6271, 12.9750, 77.7480, 550],
+    ["meera@demo.com", "Meera", 12.9380, 77.6200, 12.9720, 77.7520, 545],
+    ["karthik@demo.com", "Karthik", 12.9300, 77.6350, 12.9680, 77.7450, 560],
+    ["divya@demo.com", "Divya", 12.9500, 77.6100, 12.9700, 77.7510, 535],
+    ["arjun@demo.com", "Arjun", 12.9340, 77.6260, 12.9780, 77.6400, 540],
+    ["sneha@demo.com", "Sneha", 12.9370, 77.6210, 12.9800, 77.6430, 550],
+    ["vikram@demo.com", "Vikram", 12.9310, 77.6280, 12.9760, 77.6380, 535],
+  ];
+  for (const [email, name, a, b, c, d, t] of people) {
+    if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email)) continue;
+    const u = db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
+      .run(email, bcrypt.hashSync("password123", 10));
+    db.prepare(`INSERT INTO commuters (user_id, name, home_lat, home_lng, office_lat,
+      office_lng, depart_minutes) VALUES (?,?,?,?,?,?,?)`)
+      .run(u.lastInsertRowid, name, a, b, c, d, t);
+  }
+  console.log("demo data ready");
+}
+if (process.env.SEED_DEMO === "true") seedDemo();
+
 if (require.main === module) {
-  app.listen(4000, () => console.log("API on :4000"));
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => console.log(`API on :${PORT}`));
 }
 module.exports = { app, db };
