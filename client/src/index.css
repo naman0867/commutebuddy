@@ -56,10 +56,15 @@ input:focus { border-color: var(--ink); }
 label { display: block; font-weight: 600; font-size: 14px; margin: 14px 0 6px; }
 
 /* ---------- Login ---------- */
-.auth { min-height: 100%; display: grid; place-items: center; padding: 24px; }
+.auth {
+  min-height: 100%; display: grid; place-items: center; padding: 24px;
+  background:
+    linear-gradient(rgba(16, 24, 40, 0.55), rgba(16, 24, 40, 0.55)),
+    url("/carpool.jpg") center / cover no-repeat;
+}
 .auth-card {
   width: 100%; max-width: 400px; background: #fff; border-radius: 20px;
-  padding: 32px; box-shadow: 0 12px 40px rgba(16, 24, 40, 0.12);
+  padding: 32px; box-shadow: 0 12px 40px rgba(16, 24, 40, 0.35);
 }
 .auth-card h1 { font-size: 28px; line-height: 1.15; letter-spacing: -0.02em; margin: 24px 0 8px; }
 .auth-card .btn { margin-top: 20px; }
@@ -77,6 +82,9 @@ label { display: block; font-weight: 600; font-size: 14px; margin: 14px 0 6px; }
 /* ---------- App shell ---------- */
 .app { position: relative; height: 100dvh; overflow: hidden; }
 .map { position: absolute; inset: 0; }
+
+/* Softer map colors so the panel and pins stand out (delete if you prefer the standard look) */
+.leaflet-tile-pane { filter: saturate(0.55) brightness(1.04) contrast(0.92); }
 
 .panel {
   position: absolute; z-index: 1000; top: 16px; left: 16px; bottom: 16px; width: 392px;
