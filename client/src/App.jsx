@@ -1,5 +1,7 @@
-import { useEffect, useState } from "react";
-import { MapContainer, TileLayer, CircleMarker, Polyline, Tooltip, useMapEvents } from "react-leaflet";
+import { Fragment, useEffect, useState } from "react";
+import {
+  MapContainer, TileLayer, CircleMarker, Polyline, Tooltip, ZoomControl, useMap, useMapEvents,
+} from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
@@ -22,9 +24,42 @@ async function api(path, token, method = "GET", body) {
 
 const toTime = m =>
   `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const fmtCoord = p => `${p[0].toFixed(4)}, ${p[1].toFixed(4)}`;
+const STATUS_LABEL = { pending: "Pending", accepted: "Accepted", declined: "Declined" };
+
+function Avatar({ name }) {
+  const hue = [...(name || "?")].reduce((sum, c) => sum + c.charCodeAt(0), 0) % 360;
+  return (
+    <div
+      className="avatar"
+      style={{ background: `hsl(${hue} 60% 92%)`, color: `hsl(${hue} 55% 28%)` }}
+      aria-hidden="true"
+    >
+      {(name || "?").trim().charAt(0).toUpperCase()}
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  return <span className={`status ${status}`}>{STATUS_LABEL[status] || status}</span>;
+}
 
 function Clicker({ onPick }) {
   useMapEvents({ click: e => onPick([e.latlng.lat, e.latlng.lng]) });
+  return null;
+}
+
+// Zooms the map to fit your route and all matches, leaving room for the panel.
+function FitBounds({ points }) {
+  const map = useMap();
+  const key = JSON.stringify(points);
+  useEffect(() => {
+    if (!points.length) return;
+    const wide = window.innerWidth > 760;
+    map.fitBounds(points, wide
+      ? { paddingTopLeft: [440, 60], paddingBottomRight: [60, 60], maxZoom: 14 }
+      : { paddingTopLeft: [40, 60], paddingBottomRight: [40, 380], maxZoom: 14 });
+  }, [key]);
   return null;
 }
 
@@ -33,28 +68,59 @@ function AuthScreen({ onToken }) {
   const [password, setPassword] = useState("");
   const [isNew, setIsNew] = useState(false);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  const submit = async () => {
+  const submit = async e => {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
     try {
       const { token } = await api(isNew ? "/register" : "/login", null, "POST", { email, password });
       onToken(token);
-    } catch (e) {
-      setError(e.message);
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
     }
   };
 
+  const useDemo = () => {
+    setEmail("ravi@demo.com");
+    setPassword("password123");
+    setIsNew(false);
+    setError("");
+  };
+
   return (
-    <div style={{ maxWidth: 320, margin: "80px auto", fontFamily: "sans-serif" }}>
-      <h2>CommuteBuddy 🚗</h2>
-      <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)}
-        style={{ width: "100%", marginBottom: 8 }} />
-      <input type="password" placeholder="Password (8+ characters)" value={password}
-        onChange={e => setPassword(e.target.value)} style={{ width: "100%", marginBottom: 8 }} />
-      <button onClick={submit} style={{ width: "100%" }}>{isNew ? "Register" : "Log in"}</button>
-      <p style={{ color: "crimson" }}>{error}</p>
-      <a href="#" onClick={e => { e.preventDefault(); setIsNew(!isNew); setError(""); }}>
-        {isNew ? "I already have an account" : "Create an account"}
-      </a>
+    <div className="auth">
+      <form className="auth-card" onSubmit={submit}>
+        <div className="brand"><span className="logo" aria-hidden="true" />CommuteBuddy</div>
+        <h1>Share the ride to work</h1>
+        <p className="muted">Find coworkers whose route and departure time match yours.</p>
+
+        <label htmlFor="email">Email</label>
+        <input id="email" type="email" autoComplete="email" value={email}
+          onChange={e => setEmail(e.target.value)} />
+
+        <label htmlFor="password">Password</label>
+        <input id="password" type="password" value={password}
+          autoComplete={isNew ? "new-password" : "current-password"}
+          placeholder="At least 8 characters"
+          onChange={e => setPassword(e.target.value)} />
+
+        {error && <p className="error" role="alert">{error}</p>}
+
+        <button className="btn primary block" type="submit" disabled={busy}>
+          {busy ? "Please wait" : isNew ? "Create account" : "Log in"}
+        </button>
+
+        <div className="auth-foot">
+          <button type="button" className="link"
+            onClick={() => { setIsNew(!isNew); setError(""); }}>
+            {isNew ? "I already have an account" : "Create an account"}
+          </button>
+          <button type="button" className="link" onClick={useDemo}>Use the demo account</button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -68,6 +134,9 @@ function Main({ token, onLogout }) {
   const [matches, setMatches] = useState(null);
   const [reqs, setReqs] = useState({ incoming: [], outgoing: [] });
   const [msg, setMsg] = useState("");
+  const [tab, setTab] = useState("rides");
+  const [loading, setLoading] = useState(false);
+  const [hoverId, setHoverId] = useState(null);
 
   const call = (path, method, body) =>
     api(path, token, method, body).catch(e => {
@@ -102,13 +171,19 @@ function Main({ token, onLogout }) {
   };
 
   const findMatches = safe(async () => {
-    const [h, m] = time.split(":").map(Number);
-    await call("/me/profile", "PUT", {
-      name, home_lat: home[0], home_lng: home[1],
-      office_lat: office[0], office_lng: office[1], depart_minutes: h * 60 + m,
-    });
-    await loadMatches();
-    await loadRequests();
+    setLoading(true);
+    try {
+      const [h, m] = time.split(":").map(Number);
+      await call("/me/profile", "PUT", {
+        name, home_lat: home[0], home_lng: home[1],
+        office_lat: office[0], office_lng: office[1], depart_minutes: h * 60 + m,
+      });
+      await loadMatches();
+      await loadRequests();
+      setTab("rides");
+    } finally {
+      setLoading(false);
+    }
   });
 
   const sendRequest = safe(async id => {
@@ -123,94 +198,225 @@ function Main({ token, onLogout }) {
     if (matches) await loadMatches();
   });
 
-  const ready = name && home && office;
-  const card = { border: "1px solid #ccc", borderRadius: 6, padding: 8, marginBottom: 8 };
+  const ready = name.trim() && home && office;
+  const pending = reqs.incoming.filter(r => r.status === "pending").length;
+  const fitPoints = matches && home && office
+    ? [home, office, ...matches.flatMap(m => [m.home, m.office])]
+    : [];
 
   return (
-    <div style={{ display: "flex", height: "100vh", fontFamily: "sans-serif" }}>
-      <div style={{ width: 320, padding: 16, overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h2 style={{ margin: 0 }}>CommuteBuddy 🚗</h2>
-          <button onClick={onLogout}>Log out</button>
-        </div>
+    <div className="app">
+      <MapContainer className="map" center={[12.95, 77.68]} zoom={12} zoomControl={false}>
+        <TileLayer
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+          subdomains="abcd"
+          maxZoom={19}
+          attribution="&copy; OpenStreetMap contributors &copy; CARTO"
+        />
+        <ZoomControl position="bottomright" />
+        <Clicker onPick={pick} />
+        <FitBounds points={fitPoints} />
 
-        <input placeholder="Your name" value={name} onChange={e => setName(e.target.value)}
-          style={{ width: "100%", margin: "12px 0 8px" }} />
-        <label>Departure time</label>
-        <input type="time" value={time} onChange={e => setTime(e.target.value)}
-          style={{ width: "100%", marginBottom: 12 }} />
-        <p>
-          {!home ? "Click the map to set your HOME"
-            : !office ? "Now click your OFFICE" : "Profile ready. Click the map to change it."}
-        </p>
-        <button disabled={!ready} onClick={findMatches} style={{ width: "100%" }}>
-          Save profile and find matches
-        </button>
-        {msg && <p style={{ color: "crimson" }}>{msg}</p>}
-
-        {matches && (
-          <div style={{ marginTop: 16 }}>
-            <h3>{matches.length} match{matches.length !== 1 && "es"}</h3>
-            {matches.map(m => (
-              <div key={m.id} style={card}>
-                <strong>{m.name}</strong>
-                <div>Home {m.homeKm.toFixed(1)} km · Office {m.officeKm.toFixed(1)} km</div>
-                <div>Time gap {m.gap} min</div>
-                {m.detourKm != null && (
-                  <div>
-                    Detour if you drive: +{m.detourKm.toFixed(1)} km
-                    {" "}({m.detourSource === "road" ? "by road" : "estimate"})
-                  </div>
-                )}
-                {!m.request && (
-                  <button onClick={() => sendRequest(m.id)} style={{ marginTop: 6 }}>Request ride</button>
-                )}
-                {m.request && (
-                  <div style={{ marginTop: 6 }}>
-                    <em>{m.request.direction === "sent" ? "You requested" : "They requested you"}: {m.request.status}</em>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
+        {home && office && (
+          <Polyline positions={[home, office]} pathOptions={{ color: "#101828", weight: 4 }} />
+        )}
+        {home && (
+          <CircleMarker center={home} radius={9}
+            pathOptions={{ color: "#fff", weight: 3, fillColor: "#101828", fillOpacity: 1 }}>
+            <Tooltip>Your home</Tooltip>
+          </CircleMarker>
+        )}
+        {office && (
+          <CircleMarker center={office} radius={9}
+            pathOptions={{ color: "#fff", weight: 3, fillColor: "#2f5bff", fillOpacity: 1 }}>
+            <Tooltip>Your office</Tooltip>
+          </CircleMarker>
         )}
 
-        <h3>Requests for you</h3>
-        {reqs.incoming.length === 0 && <p>None yet.</p>}
-        {reqs.incoming.map(r => (
-          <div key={r.id} style={card}>
-            <strong>{r.name}</strong> wants to ride with you ({r.status})
-            {r.status === "pending" && (
-              <div style={{ marginTop: 6 }}>
-                <button onClick={() => respond(r.id, "accepted")}>Accept</button>{" "}
-                <button onClick={() => respond(r.id, "declined")}>Decline</button>
-              </div>
-            )}
-          </div>
-        ))}
-
-        <h3>Your requests</h3>
-        {reqs.outgoing.length === 0 && <p>None yet.</p>}
-        {reqs.outgoing.map(r => (
-          <div key={r.id} style={card}><strong>{r.name}</strong>: {r.status}</div>
-        ))}
-      </div>
-
-      <MapContainer center={[12.95, 77.68]} zoom={12} style={{ flex: 1 }}>
-        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          attribution="&copy; OpenStreetMap contributors" />
-        <Clicker onPick={pick} />
-        {home && <CircleMarker center={home} radius={9} pathOptions={{ color: "green" }}><Tooltip>Your home</Tooltip></CircleMarker>}
-        {office && <CircleMarker center={office} radius={9} pathOptions={{ color: "red" }}><Tooltip>Your office</Tooltip></CircleMarker>}
-        {home && office && <Polyline positions={[home, office]} pathOptions={{ color: "green" }} />}
-        {matches?.map(m => (
-          <span key={m.id}>
-            <CircleMarker center={m.home} radius={7} pathOptions={{ color: "blue" }}><Tooltip>{m.name} home</Tooltip></CircleMarker>
-            <CircleMarker center={m.office} radius={7} pathOptions={{ color: "orange" }}><Tooltip>{m.name} office</Tooltip></CircleMarker>
-            <Polyline positions={[m.home, m.office]} pathOptions={{ color: "blue", dashArray: "6" }} />
-          </span>
-        ))}
+        {matches?.map(m => {
+          const active = hoverId === m.id;
+          return (
+            <Fragment key={m.id}>
+              <Polyline positions={[m.home, m.office]}
+                pathOptions={{
+                  color: "#2f5bff", dashArray: active ? undefined : "6 8",
+                  weight: active ? 5 : 3, opacity: active ? 1 : 0.4,
+                }} />
+              <CircleMarker center={m.home} radius={6}
+                pathOptions={{ color: "#fff", weight: 2, fillColor: "#2f5bff", fillOpacity: 1 }}>
+                <Tooltip>{m.name}'s home</Tooltip>
+              </CircleMarker>
+              <CircleMarker center={m.office} radius={6}
+                pathOptions={{ color: "#fff", weight: 2, fillColor: "#2f5bff", fillOpacity: 1 }}>
+                <Tooltip>{m.name}'s office</Tooltip>
+              </CircleMarker>
+            </Fragment>
+          );
+        })}
       </MapContainer>
+
+      {matches && (
+        <div className="legend">
+          <div><span className="swatch" />Your route</div>
+          <div><span className="swatch dashed" />Other commuters</div>
+        </div>
+      )}
+
+      <aside className="panel">
+        <div className="panel-head">
+          <div className="brand"><span className="logo" aria-hidden="true" />CommuteBuddy</div>
+          <button className="btn ghost small" onClick={onLogout}>Log out</button>
+        </div>
+
+        <div className="planner">
+          <div className="stops">
+            <button type="button" className={`stop ${mode === "home" ? "active" : ""}`}
+              onClick={() => setMode("home")}>
+              <span className="dot from" />
+              <span className="stop-text">
+                <strong>{home ? "Home" : "Set your home"}</strong>
+                <span>{home ? fmtCoord(home) : "Click the map to drop a pin"}</span>
+              </span>
+            </button>
+            <button type="button" className={`stop ${mode === "office" ? "active" : ""}`}
+              onClick={() => setMode("office")}>
+              <span className="dot to" />
+              <span className="stop-text">
+                <strong>{office ? "Office" : "Set your office"}</strong>
+                <span>{office ? fmtCoord(office) : "Click the map to drop a pin"}</span>
+              </span>
+            </button>
+          </div>
+
+          <div className="fields">
+            <input aria-label="Your name" placeholder="Your name" value={name}
+              onChange={e => setName(e.target.value)} />
+            <input aria-label="Departure time" type="time" value={time}
+              onChange={e => setTime(e.target.value)} />
+          </div>
+
+          <button className="btn primary block" disabled={!ready || loading} onClick={findMatches}>
+            {loading ? "Finding rides" : "Find rides"}
+          </button>
+          {msg && <p className="error" role="alert">{msg}</p>}
+        </div>
+
+        <div className="tabs" role="tablist">
+          <button className="tab" role="tab" aria-selected={tab === "rides"}
+            onClick={() => setTab("rides")}>Rides</button>
+          <button className="tab" role="tab" aria-selected={tab === "requests"}
+            onClick={() => setTab("requests")}>
+            Requests{pending > 0 && <span className="count">{pending}</span>}
+          </button>
+        </div>
+
+        <div className="list">
+          {tab === "rides" && (
+            <>
+              {!matches && (
+                <div className="empty">
+                  <strong>Where are you headed?</strong>
+                  Pin your home and office, pick a departure time, then find rides.
+                </div>
+              )}
+              {matches && matches.length === 0 && (
+                <div className="empty">
+                  <strong>No rides match yet</strong>
+                  Try a different departure time, or move your pins closer to other commuters.
+                </div>
+              )}
+              {matches?.map(m => (
+                <article key={m.id} className="ride"
+                  onMouseEnter={() => setHoverId(m.id)} onMouseLeave={() => setHoverId(null)}>
+                  <div className="ride-top">
+                    <Avatar name={m.name} />
+                    <div className="ride-who">
+                      <strong>{m.name}</strong>
+                      <span className="muted">
+                        {m.gap === 0 ? "Departs at the same time as you" : `Departs ${m.gap} min before or after you`}
+                      </span>
+                    </div>
+                    {m.detourKm != null && <span className="chip">+{m.detourKm.toFixed(1)} km detour</span>}
+                  </div>
+                  <ul className="facts">
+                    <li>{m.homeKm.toFixed(1)} km from your home</li>
+                    <li>{m.officeKm.toFixed(1)} km from your office</li>
+                    {m.detourKm != null && (
+                      <li>{m.detourSource === "road" ? "Detour measured by road" : "Detour is an estimate"}</li>
+                    )}
+                  </ul>
+                  <div className="ride-actions">
+                    {!m.request && (
+                      <button className="btn accent small" onClick={() => sendRequest(m.id)}>
+                        Request ride
+                      </button>
+                    )}
+                    {m.request && (
+                      <>
+                        <StatusBadge status={m.request.status} />
+                        <span className="muted">
+                          {m.request.direction === "sent" ? "You requested" : "They requested you"}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </>
+          )}
+
+          {tab === "requests" && (
+            <>
+              <h3 className="section-title">Requests for you</h3>
+              {reqs.incoming.length === 0 && (
+                <div className="empty">
+                  <strong>Nothing waiting</strong>
+                  When someone asks to ride with you, it shows up here.
+                </div>
+              )}
+              {reqs.incoming.map(r => (
+                <article key={r.id} className="ride">
+                  <div className="ride-top">
+                    <Avatar name={r.name} />
+                    <div className="ride-who">
+                      <strong>{r.name}</strong>
+                      <span className="muted">wants to ride with you</span>
+                    </div>
+                    {r.status !== "pending" && <StatusBadge status={r.status} />}
+                  </div>
+                  {r.status === "pending" && (
+                    <div className="ride-actions" style={{ marginTop: 12 }}>
+                      <button className="btn primary small" onClick={() => respond(r.id, "accepted")}>
+                        Accept
+                      </button>
+                      <button className="btn ghost small" onClick={() => respond(r.id, "declined")}>
+                        Decline
+                      </button>
+                    </div>
+                  )}
+                </article>
+              ))}
+
+              <h3 className="section-title">Your requests</h3>
+              {reqs.outgoing.length === 0 && (
+                <div className="empty">
+                  <strong>No requests sent</strong>
+                  Request a ride from the Rides tab.
+                </div>
+              )}
+              {reqs.outgoing.map(r => (
+                <article key={r.id} className="ride">
+                  <div className="ride-top">
+                    <Avatar name={r.name} />
+                    <div className="ride-who"><strong>{r.name}</strong></div>
+                    <StatusBadge status={r.status} />
+                  </div>
+                </article>
+              ))}
+            </>
+          )}
+        </div>
+      </aside>
     </div>
   );
 }
